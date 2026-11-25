@@ -1,0 +1,1262 @@
+"""
+LoRA Block Weight Extension for ForgeNEO
+Allows per-block weight control of LoRA models across SD, Flux, Anima, Wan, and Qwen-Image.
+
+Supports:
+  - Inline syntax:  <lora:name:1:lbw=FACE>         (preset name)
+  - Inline syntax:  <lora:name:1:lbw=1,0,0,...>    (named block vector)
+  - Positional:     <lora:name:1:1,0,0,...>        (positional block vector)
+  - Interactive in-prompt popover with real-time sliders and preset management
+"""
+
+import logging
+import os
+import json
+import math
+import re
+import struct
+import tempfile
+from typing import Optional, Dict, List, Any
+
+import modules.scripts as scripts
+from modules import shared
+
+logger = logging.getLogger("lora_block_weight")
+
+
+# ═══════════════════════════════════════════════════════════
+#  ArchitectureProfile Engine
+# ═══════════════════════════════════════════════════════════
+
+class ArchitectureProfile:
+    def __init__(
+        self,
+        name: str,
+        display_name: str,
+        block_count: int,
+        block_names: Dict[str, int],
+        presets: Dict[str, str],
+    ):
+        self.name = name
+        self.display_name = display_name
+        self.block_count = block_count
+        self.block_names = block_names
+        self.presets = presets
+
+    def resolve_block_name(self, name: str) -> Optional[List[float]]:
+        idx = self.block_names.get(name.upper())
+        if idx is not None and idx < self.block_count:
+            vec = [0.0] * self.block_count
+            vec[idx] = 1.0
+            return vec
+        return None
+
+
+# Regex patterns for key detection (supports both standard dot and Kohya underscore separators)
+_RE_SD_IN = re.compile(r"(?:input_blocks|down_blocks)[._](\d+)[._]")
+_RE_SD_MID = re.compile(r"(?:middle_block|mid_block)[._]")
+_RE_SD_OUT = re.compile(r"(?:output_blocks|up_blocks)[._](\d+)[._]")
+_RE_SD_BASE = re.compile(r"(?:model[._])?(?:diffusion_model[._])?(time_embed|label_emb|out)[._]")
+
+_RE_FLUX_DBL = re.compile(r"double_blocks[._](\d+)[._]")
+_RE_FLUX_SNG = re.compile(r"single_blocks[._](\d+)[._]")
+
+_RE_BLOCKS = re.compile(r"blocks[._](\d+)[._]")
+# Explicitly match DiT transformer blocks while excluding LLM adapter and text encoder blocks
+_RE_DIT_BLOCKS = re.compile(r"(?<!llm_adapter\.)(?<!text_encoders\.)(?<!text_conditioner\.)\bblocks[._](\d+)[._]")
+
+_RE_MOSS_LAYERS = re.compile(r"(?:transformer[._]|diffusion_model[._])?layers[._](\d+)[._]")
+
+
+# Canonical Anima block mappings from SD WebUI Neo backend/nn/anima.py
+ANIMA_BLOCK_MAPPINGS: Dict[tuple, List[int]] = {
+    (28, 40): [0, 1, 1, 2, 3, 3, 4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 16, 17, 18, 18, 19, 20, 20, 21, 22, 22, 23, 24, 24, 25, 26, 27],
+    (28, 52): [0, 1, 1, 1, 2, 3, 3, 3, 4, 5, 5, 5, 6, 7, 7, 7, 8, 9, 9, 9, 10, 11, 11, 11, 12, 13, 14, 14, 14, 15, 16, 16, 16, 17, 18, 18, 18, 19, 20, 20, 20, 21, 22, 22, 22, 23, 24, 24, 24, 25, 26, 27],
+    (40, 52): [0, 1, 2, 2, 3, 4, 5, 5, 6, 7, 8, 8, 9, 10, 11, 11, 12, 13, 14, 14, 15, 16, 17, 17, 18, 19, 20, 20, 21, 22, 23, 23, 24, 25, 26, 26, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 35, 35, 36, 37, 38, 39],
+}
+
+def adapt_block_weights(weights: List[float], target_len: int, arch: str = "sd") -> List[float]:
+    """Adapt or interpolate weight vectors to match target block length."""
+    src_len = len(weights)
+    if src_len == target_len:
+        return weights
+
+    # Single-element vector broadcasting: e.g. [0.5] -> [0.5] * target_len
+    if src_len == 1 and target_len > 1:
+        return [weights[0]] * target_len
+
+    # SD 17-block to 26-block expansion
+    if src_len == 17 and target_len == 26 and "sd" in arch:
+        indices_17 = [0, 2, 3, 5, 6, 8, 9, 13, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+        expanded = [weights[0]] * 26
+        for val, idx in zip(weights, indices_17):
+            expanded[idx] = val
+        return expanded
+
+    # SDXL 12-block to 26-block expansion
+    if src_len == 12 and target_len == 26 and "sd" in arch:
+        indices_12 = [0, 5, 6, 8, 9, 13, 14, 15, 16, 17, 18, 19]
+        expanded = [weights[0]] * 26
+        for val, idx in zip(weights, indices_12):
+            expanded[idx] = val
+        return expanded
+
+    # Flux 57-block adapt to Klein
+    if src_len == 57 and "flux" in arch:
+        dbl_src = weights[:19]
+        sng_src = weights[19:57]
+        if target_len == 32:  # 8 dbl + 24 sng
+            return dbl_src[:8] + sng_src[:24]
+        if target_len == 25:  # 5 dbl + 20 sng
+            return dbl_src[:5] + sng_src[:20]
+
+    # Anima canonical block mapping
+    if "anima" in arch and (src_len, target_len) in ANIMA_BLOCK_MAPPINGS:
+        mapping = ANIMA_BLOCK_MAPPINGS[(src_len, target_len)]
+        return [weights[src_idx] for src_idx in mapping]
+
+    logger.warning(f"[LBW] Block count mismatch ({src_len} != {target_len}) for arch '{arch}'. Resampling weights.")
+
+    # Linear interpolation for continuous architectures (Anima, Wan)
+    if src_len > 1 and target_len > 1:
+        resampled = []
+        for i in range(target_len):
+            src_pos = i * (src_len - 1) / (target_len - 1)
+            lower = int(src_pos)
+            upper = min(lower + 1, src_len - 1)
+            frac = src_pos - lower
+            val = (1.0 - frac) * weights[lower] + frac * weights[upper]
+            resampled.append(val)
+        return resampled
+
+    # Fallback pad or slice
+    if src_len < target_len:
+        return weights + [1.0] * (target_len - src_len)
+    return weights[:target_len]
+
+
+# SD / SDXL (26 values: 0=BASE, 1-12=IN00-IN11, 13=M00, 14-25=OUT00-OUT11)
+SDXL_PRESETS = {
+    # Early down-blocks encode spatial layout and pose
+    "COMPOSITION": "1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0",
+    # Deep down-blocks, mid bottleneck, and early up-blocks capture identity and facial features
+    "FACE":        "0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0",
+    # Mid-to-late output blocks decode color palettes and aesthetic styling
+    "STYLE":       "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1",
+    # Deepest output blocks decode high-frequency lines and micro-textures
+    "TEXTURE":     "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1",
+}
+SDXL_BLOCK_NAMES = {
+    "BASE": 0,
+    **{f"IN{i:02d}": i + 1 for i in range(12)},
+    "M00": 13, "MID": 13, "MIDD": 13,
+    **{f"OUT{i:02d}": i + 14 for i in range(12)},
+}
+
+def _sd_get_block_index(key: str) -> Optional[int]:
+    m = _RE_SD_IN.search(key)
+    if m:
+        return int(m.group(1)) + 1
+    if _RE_SD_MID.search(key):
+        return 13
+    m = _RE_SD_OUT.search(key)
+    if m:
+        return int(m.group(1)) + 14
+    if _RE_SD_BASE.search(key):
+        return 0
+    return None
+
+class SDXLProfile(ArchitectureProfile):
+    def __init__(self):
+        super().__init__(
+            name="sdxl",
+            display_name="SD/XL",
+            block_count=26,
+            block_names=SDXL_BLOCK_NAMES,
+            presets=SDXL_PRESETS,
+        )
+    def get_block_index(self, key: str) -> Optional[int]:
+        return _sd_get_block_index(key)
+
+
+# Flux.1 (57 values: 19 double + 38 single)
+FLUX1_PRESETS = {
+    "COMPOSITION": ",".join(["1"] * 10 + ["0"] * 9 + ["0"] * 38),
+    "FACE":        ",".join(["0"] * 10 + ["1"] * 9 + ["1"] * 10 + ["0"] * 28),
+    "STYLE":       ",".join(["0"] * 19 + ["0"] * 10 + ["1"] * 28),
+    "TEXTURE":     ",".join(["0"] * 19 + ["0"] * 28 + ["1"] * 10),
+}
+
+class FluxProfile(ArchitectureProfile):
+    def __init__(
+        self,
+        name: str = "flux1",
+        display_name: str = "Flux.1",
+        num_dbl: int = 19,
+        num_sng: int = 38,
+        presets: Optional[Dict[str, str]] = None,
+    ):
+        block_names = {
+            **{f"D{i:02d}": i for i in range(num_dbl)},
+            **{f"S{i:02d}": i + num_dbl for i in range(num_sng)},
+        }
+        super().__init__(
+            name=name,
+            display_name=display_name,
+            block_count=num_dbl + num_sng,
+            block_names=block_names,
+            presets=dict(presets if presets is not None else FLUX1_PRESETS),
+        )
+        self.num_dbl = num_dbl
+        self.num_sng = num_sng
+
+    def get_block_index(self, key: str) -> Optional[int]:
+        m = _RE_FLUX_DBL.search(key)
+        if m:
+            return int(m.group(1))
+        m = _RE_FLUX_SNG.search(key)
+        if m:
+            return int(m.group(1)) + self.num_dbl
+        return None
+
+
+# Flux.2-Klein 9B (32 values: 8 double + 24 single)
+FLUX_KLEIN_9B_PRESETS = {
+    "COMPOSITION": ",".join(["1"] * 4 + ["0"] * 4 + ["0"] * 24),
+    "FACE":        ",".join(["0"] * 4 + ["1"] * 4 + ["1"] * 6 + ["0"] * 18),
+    "STYLE":       ",".join(["0"] * 8 + ["0"] * 6 + ["1"] * 18),
+    "TEXTURE":     ",".join(["0"] * 8 + ["0"] * 18 + ["1"] * 6),
+}
+
+
+# Flux.2-Klein 4B (25 values: 5 double + 20 single)
+FLUX_KLEIN_4B_PRESETS = {
+    "COMPOSITION": ",".join(["1"] * 3 + ["0"] * 2 + ["0"] * 20),
+    "FACE":        ",".join(["0"] * 3 + ["1"] * 2 + ["1"] * 5 + ["0"] * 15),
+    "STYLE":       ",".join(["0"] * 5 + ["0"] * 5 + ["1"] * 15),
+    "TEXTURE":     ",".join(["0"] * 5 + ["0"] * 15 + ["1"] * 5),
+}
+
+
+# Anima (Canonical 28 blocks: B00-B27, mapped canonically to 40/52)
+ANIMA_PRESETS = {
+    "COMPOSITION": ",".join(["1"] * 7 + ["0"] * 21),
+    "FACE":        ",".join(["0"] * 7 + ["1"] * 11 + ["0"] * 10),
+    "STYLE":       ",".join(["0"] * 14 + ["1"] * 14),
+    "TEXTURE":     ",".join(["0"] * 24 + ["1"] * 4),
+}
+
+class AnimaProfile(ArchitectureProfile):
+    def __init__(self, block_count=28):
+        disp = f"Anima ({block_count} Blocks)"
+        if block_count == 28:
+            presets = dict(ANIMA_PRESETS)
+        else:
+            presets = {
+                k: ",".join(str(int(v) if v.is_integer() else v) for v in adapt_block_weights(
+                    [float(x) for x in vec.split(",")], block_count, arch="anima"
+                ))
+                for k, vec in ANIMA_PRESETS.items()
+            }
+        super().__init__(
+            name=f"anima{block_count}",
+            display_name=disp,
+            block_count=block_count,
+            block_names={f"B{i:02d}": i for i in range(block_count)},
+            presets=presets,
+        )
+    def get_block_index(self, key: str) -> Optional[int]:
+        if "llm_adapter" in key or "text_encoders" in key or "text_conditioner" in key:
+            return None
+        m = _RE_DIT_BLOCKS.search(key)
+        return int(m.group(1)) if m else None
+
+
+
+# Wan 2.1 (14B: 40 blocks, 1.3B: 30 blocks)
+WAN_14B_PRESETS = {
+    "COMPOSITION": ",".join(["1"] * 10 + ["0"] * 30),
+    "FACE":        ",".join(["0"] * 10 + ["1"] * 15 + ["0"] * 15),
+    "STYLE":       ",".join(["0"] * 20 + ["1"] * 20),
+    "TEXTURE":     ",".join(["0"] * 32 + ["1"] * 8),
+}
+
+WAN_13B_PRESETS = {
+    "COMPOSITION": ",".join(["1"] * 8 + ["0"] * 22),
+    "FACE":        ",".join(["0"] * 8 + ["1"] * 12 + ["0"] * 10),
+    "STYLE":       ",".join(["0"] * 15 + ["1"] * 15),
+    "TEXTURE":     ",".join(["0"] * 24 + ["1"] * 6),
+}
+
+class WanProfile(ArchitectureProfile):
+    def __init__(self, block_count=40):
+        name = f"wan21_{'14b' if block_count >= 40 else '13b'}"
+        disp = "Wan2.1-14B" if block_count >= 40 else "Wan2.1-1.3B"
+        presets = WAN_14B_PRESETS if block_count >= 40 else WAN_13B_PRESETS
+        super().__init__(
+            name=name,
+            display_name=disp,
+            block_count=block_count,
+            block_names={f"B{i:02d}": i for i in range(block_count)},
+            presets=dict(presets),
+        )
+    def get_block_index(self, key: str) -> Optional[int]:
+        m = _RE_BLOCKS.search(key)
+        if m:
+            return int(m.group(1))
+        if any(x in key for x in ("patch_embedding", "time_projection", "head.")):
+            return 0
+        return None
+
+
+# Qwen-Image (60 blocks default, 32 blocks variant)
+_RE_QWEN_BLOCKS = re.compile(r"transformer_blocks[._](\d+)[._]")
+
+QWEN_PRESETS = {
+    "COMPOSITION": ",".join(["1"] * 15 + ["0"] * 45),
+    "FACE":        ",".join(["0"] * 15 + ["1"] * 25 + ["0"] * 20),
+    "STYLE":       ",".join(["0"] * 30 + ["1"] * 30),
+    "TEXTURE":     ",".join(["0"] * 50 + ["1"] * 10),
+}
+
+class QwenImageProfile(ArchitectureProfile):
+    def __init__(self, block_count=60):
+        super().__init__(
+            name="qwen_image",
+            display_name="Qwen-Image",
+            block_count=block_count,
+            block_names={f"B{i:02d}": i for i in range(block_count)},
+            presets=QWEN_PRESETS,
+        )
+    def get_block_index(self, key: str) -> Optional[int]:
+        m = _RE_QWEN_BLOCKS.search(key)
+        if m:
+            return int(m.group(1))
+        if any(x in key for x in ("img_in", "txt_in", "norm_out", "proj_out", "time_text_embed")):
+            return 0
+        return None
+
+
+# MOSS-Image (42 blocks default single-stream DiT)
+MOSS_PRESETS = {
+    "COMPOSITION": ",".join(["1"] * 11 + ["0"] * 31),
+    "FACE":        ",".join(["0"] * 10 + ["1"] * 16 + ["0"] * 16),
+    "STYLE":       ",".join(["0"] * 21 + ["1"] * 21),
+    "TEXTURE":     ",".join(["0"] * 34 + ["1"] * 8),
+}
+
+class MossImageProfile(ArchitectureProfile):
+    def __init__(self, block_count=42):
+        super().__init__(
+            name="moss_image",
+            display_name="MOSS-Image",
+            block_count=block_count,
+            block_names={f"B{i:02d}": i for i in range(block_count)},
+            presets=dict(MOSS_PRESETS),
+        )
+    def get_block_index(self, key: str) -> Optional[int]:
+        m = _RE_MOSS_LAYERS.search(key)
+        if m:
+            return int(m.group(1))
+        m_blk = _RE_BLOCKS.search(key)
+        if m_blk:
+            return int(m_blk.group(1))
+        if any(x in key for x in ("patch_embedding", "text_embedder", "time_embed", "norm_out", "proj_out")):
+            return 0
+        return None
+
+
+PROFILE_REGISTRY: Dict[str, ArchitectureProfile] = {
+    "sd15": SDXLProfile(),
+    "sdxl": SDXLProfile(),
+    "flux1": FluxProfile(),
+    "flux_k9b": FluxProfile("flux_k9b", "F2-K9B", 8, 24, FLUX_KLEIN_9B_PRESETS),
+    "flux_k4b": FluxProfile("flux_k4b", "F2-K4B", 5, 20, FLUX_KLEIN_4B_PRESETS),
+    "anima28": AnimaProfile(28),
+    "anima40": AnimaProfile(40),
+    "anima52": AnimaProfile(52),
+    "wan21_14b": WanProfile(40),
+    "wan21_13b": WanProfile(30),
+    "qwen_image": QwenImageProfile(60),
+    "moss_image": MossImageProfile(42),
+    "moss": MossImageProfile(42),
+}
+
+# Built-in presets protected against deletion/override
+BUILTIN_PRESET_NAMES = {"COMPOSITION", "FACE", "STYLE", "TEXTURE", "RESET"}
+
+
+# ═══════════════════════════════════════════════════════════
+#  User Presets Persistence
+# ═══════════════════════════════════════════════════════════
+
+def _get_user_presets_file() -> str:
+    base = getattr(shared, "data_path", None) or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    target_dir = os.path.join(base, "extensions", "sd-forge-lbw")
+    os.makedirs(target_dir, exist_ok=True)
+    return os.path.join(target_dir, "lbw_presets.json")
+
+USER_PRESETS_FILE = _get_user_presets_file()
+
+def _filter_user_presets(raw: Any) -> Dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    return {pk: pv for pk, pv in raw.items() if pk.upper() not in BUILTIN_PRESET_NAMES}
+
+def _load_user_presets():
+    if os.path.exists(USER_PRESETS_FILE):
+        try:
+            with open(USER_PRESETS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.items():
+                if k in PROFILE_REGISTRY:
+                    PROFILE_REGISTRY[k].presets.update(_filter_user_presets(v))
+            alias_targets = {
+                "sdxl": ("sd15",),
+                "flux": ("flux1",),
+                "anima": ("anima28", "anima40", "anima52"),
+                "wan": ("wan21_14b", "wan21_13b"),
+            }
+            for alias, targets in alias_targets.items():
+                if alias in data:
+                    safe = _filter_user_presets(data[alias])
+                    for t in targets:
+                        if t in PROFILE_REGISTRY:
+                            PROFILE_REGISTRY[t].presets.update(safe)
+            moss_data = data.get("moss_image") or data.get("moss")
+            if moss_data and "moss_image" in PROFILE_REGISTRY:
+                PROFILE_REGISTRY["moss_image"].presets.update(_filter_user_presets(moss_data))
+        except Exception as e:
+            logger.error(f"[LBW] Failed to load user presets: {e}")
+
+_load_user_presets()
+
+
+# ═══════════════════════════════════════════════════════════
+#  Architecture Detection & Key Mapping
+# ═══════════════════════════════════════════════════════════
+
+def detect_model_profile(patch_keys) -> ArchitectureProfile:
+    """Detect architecture profile with exact block count inspection."""
+    keys_set = set(patch_keys)
+
+    # 1. SD / SDXL detection
+    for k in keys_set:
+        if _RE_SD_IN.search(k) or _RE_SD_OUT.search(k) or _RE_SD_MID.search(k):
+            return PROFILE_REGISTRY["sdxl"]
+
+    # 2. Flux variants detection
+    dbl_max = -1
+    sng_max = -1
+    has_flux = False
+    for k in keys_set:
+        m_dbl = _RE_FLUX_DBL.search(k)
+        if m_dbl:
+            dbl_max = max(dbl_max, int(m_dbl.group(1)))
+            has_flux = True
+        m_sng = _RE_FLUX_SNG.search(k)
+        if m_sng:
+            sng_max = max(sng_max, int(m_sng.group(1)))
+            has_flux = True
+
+    if has_flux:
+        num_dbl = dbl_max + 1 if dbl_max != -1 else 0
+        num_sng = sng_max + 1 if sng_max != -1 else 0
+        if num_dbl == 8 and num_sng == 24:
+            return PROFILE_REGISTRY["flux_k9b"]
+        elif num_dbl == 5 and num_sng == 20:
+            return PROFILE_REGISTRY["flux_k4b"]
+        elif num_dbl == 19 and num_sng == 38:
+            return PROFILE_REGISTRY["flux1"]
+        else:
+            return FluxProfile(num_dbl=max(1, num_dbl), num_sng=max(0, num_sng))
+
+    # 3. Qwen-Image detection
+    qwen_max = -1
+    for k in keys_set:
+        m = _RE_QWEN_BLOCKS.search(k)
+        if m:
+            qwen_max = max(qwen_max, int(m.group(1)))
+    if qwen_max != -1:
+        num_blocks = qwen_max + 1
+        return QwenImageProfile(num_blocks)
+
+    # 4. MOSS-Image detection
+    moss_max = -1
+    has_moss = False
+    for k in keys_set:
+        m = _RE_MOSS_LAYERS.search(k)
+        if m:
+            moss_max = max(moss_max, int(m.group(1)))
+            has_moss = True
+        elif "moss" in k.lower():
+            has_moss = True
+    if has_moss:
+        num_blocks = moss_max + 1 if moss_max != -1 else 42
+        return MossImageProfile(num_blocks) if num_blocks != 42 else PROFILE_REGISTRY["moss_image"]
+
+    # 5. Wan 2.1 vs Anima detection
+    is_wan = any("patch_embedding" in k or "time_projection" in k or "head." in k or "wan" in k.lower() for k in keys_set)
+    is_anima = any("adaln_modulation" in k or "llm_adapter" in k or "qwen" in k.lower() or "anima" in k.lower() for k in keys_set)
+    block_max = -1
+    for k in keys_set:
+        m = _RE_DIT_BLOCKS.search(k)
+        if m:
+            block_max = max(block_max, int(m.group(1)))
+
+    if is_wan and not is_anima:
+        num_blocks = block_max + 1 if block_max != -1 else 40
+        return PROFILE_REGISTRY["wan21_14b"] if num_blocks >= 40 else PROFILE_REGISTRY["wan21_13b"]
+
+    if block_max != -1:
+        num_blocks = block_max + 1
+        if num_blocks == 42 and not is_anima and not is_wan:
+            return PROFILE_REGISTRY["moss_image"]
+        if num_blocks == 40 and not is_anima:
+            # Default 40-block DiT without Anima markers to Wan 14B
+            return PROFILE_REGISTRY["wan21_14b"]
+        if num_blocks == 28:
+            return PROFILE_REGISTRY["anima28"]
+        elif num_blocks == 40:
+            return PROFILE_REGISTRY["anima40"]
+        elif num_blocks == 52:
+            return PROFILE_REGISTRY["anima52"]
+        return AnimaProfile(num_blocks)
+
+    return PROFILE_REGISTRY["sdxl"]
+
+
+def inspect_safetensors_data(filepath: str):
+    """Read header tensor keys and metadata dict of a .safetensors file in <1ms."""
+    try:
+        if not os.path.isfile(filepath):
+            return [], {}
+        with open(filepath, "rb") as f:
+            header_size_bytes = f.read(8)
+            if len(header_size_bytes) < 8:
+                return [], {}
+            header_size = struct.unpack("<Q", header_size_bytes)[0]
+            if header_size <= 0 or header_size > 67108864:  # Safety cap at 64MB
+                return [], {}
+            header_json_bytes = f.read(header_size)
+            header = json.loads(header_json_bytes.decode("utf-8"))
+            meta = header.get("__metadata__", {})
+            keys = [k for k in header.keys() if k != "__metadata__"]
+            return keys, meta
+    except Exception as e:
+        logger.debug(f"[LBW] Could not inspect safetensors header for {filepath}: {e}")
+        return [], {}
+
+
+_lora_filepath_cache: Dict[str, str] = {}
+
+
+def resolve_lora_filepath(name: str) -> Optional[str]:
+    """Resolve LoRA name or alias to absolute filepath via Forge networks registry and disk fallback."""
+    if not name:
+        return None
+
+    if name in _lora_filepath_cache:
+        cached = _lora_filepath_cache[name]
+        if os.path.isfile(cached):
+            return cached
+
+    base = os.path.splitext(os.path.basename(name))[0]
+    if base in _lora_filepath_cache:
+        cached = _lora_filepath_cache[base]
+        if os.path.isfile(cached):
+            return cached
+
+    # 1. Try Forge networks module registry
+    try:
+        try:
+            import networks as networks_module
+        except ImportError:
+            from extensions_builtin.sd_forge_lora import networks as networks_module
+
+        net = networks_module.available_networks.get(name) or networks_module.available_network_aliases.get(name)
+        if net is None:
+            net = networks_module.available_networks.get(base) or networks_module.available_network_aliases.get(base)
+        if net is not None and getattr(net, "filename", None) and os.path.isfile(net.filename):
+            _lora_filepath_cache[name] = net.filename
+            _lora_filepath_cache[base] = net.filename
+            return net.filename
+
+        lower_name = name.lower()
+        lower_base = base.lower()
+        for k, v in networks_module.available_networks.items():
+            k_low = k.lower()
+            if (k_low == lower_name or k_low == lower_base) and getattr(v, "filename", None) and os.path.isfile(v.filename):
+                _lora_filepath_cache[name] = v.filename
+                _lora_filepath_cache[base] = v.filename
+                return v.filename
+        for k, v in networks_module.available_network_aliases.items():
+            k_low = k.lower()
+            if (k_low == lower_name or k_low == lower_base) and getattr(v, "filename", None) and os.path.isfile(v.filename):
+                _lora_filepath_cache[name] = v.filename
+                _lora_filepath_cache[base] = v.filename
+                return v.filename
+    except Exception as e:
+        logger.debug(f"[LBW] networks_module lookup error: {e}")
+
+    # 2. Search configured LoRA directories on disk as fallback
+    try:
+        lower_base = base.lower()
+        lora_dirs = []
+        cmd_opts = getattr(shared, "cmd_opts", None)
+        if cmd_opts:
+            if getattr(cmd_opts, "lora_dir", None):
+                lora_dirs.append(cmd_opts.lora_dir)
+            if getattr(cmd_opts, "lora_dirs", None):
+                lora_dirs.extend(cmd_opts.lora_dirs)
+        default_dir = os.path.join(getattr(shared, "models_path", "models"), "Lora")
+        if default_dir not in lora_dirs:
+            lora_dirs.append(default_dir)
+
+        for l_dir in lora_dirs:
+            if not os.path.isdir(l_dir):
+                continue
+            for root, _, files in os.walk(l_dir):
+                for f in files:
+                    if f.endswith(".safetensors") and os.path.splitext(f)[0].lower() == lower_base:
+                        full_path = os.path.join(root, f)
+                        _lora_filepath_cache[name] = full_path
+                        _lora_filepath_cache[base] = full_path
+                        return full_path
+    except Exception as e:
+        logger.debug(f"[LBW] Error resolving LoRA filepath on disk for '{name}': {e}")
+
+    return None
+
+
+_detected_arch_cache: Dict[str, str] = {}
+
+
+def detect_lora_arch_by_name(name: str) -> Optional[ArchitectureProfile]:
+    """Inspect safetensors keys and metadata from disk to determine exact architecture profile."""
+    if not name:
+        return None
+    if name in _detected_arch_cache:
+        prof_key = _detected_arch_cache[name]
+        return PROFILE_REGISTRY.get(prof_key)
+
+    filepath = resolve_lora_filepath(name)
+    if not filepath or not filepath.endswith(".safetensors"):
+        return None
+
+    keys, meta = inspect_safetensors_data(filepath)
+    if not keys and not meta:
+        return None
+
+    # Check explicit metadata hints (e.g. ss_base_model_version: anima, moss)
+    meta_arch = str(meta.get("ss_base_model_version", "")).lower()
+    modelspec_arch = str(meta.get("modelspec.architecture", "")).lower()
+    is_meta_anima = "anima" in meta_arch or "anima" in modelspec_arch
+    is_meta_moss = "moss" in meta_arch or "moss" in modelspec_arch
+
+    profile = detect_model_profile(keys)
+
+    # If keys detection was ambiguous or defaulted to SDXL but metadata explicitly declares moss
+    if (profile is None or profile.name == "sdxl") and is_meta_moss:
+        profile = PROFILE_REGISTRY["moss_image"]
+
+    # If keys detection was ambiguous or defaulted to SDXL but metadata explicitly declares anima
+    if (profile is None or profile.name == "sdxl") and is_meta_anima:
+        block_max = -1
+        for k in keys:
+            m = _RE_DIT_BLOCKS.search(k)
+            if m:
+                block_max = max(block_max, int(m.group(1)))
+        total_blocks = block_max + 1 if block_max != -1 else 28
+        if total_blocks == 52:
+            profile = PROFILE_REGISTRY["anima52"]
+        elif total_blocks >= 40:
+            profile = PROFILE_REGISTRY["anima40"]
+        else:
+            profile = PROFILE_REGISTRY["anima28"]
+
+    if profile:
+        _detected_arch_cache[name] = profile.name
+    return profile
+
+
+# Legacy preset alias mappings for backward compatibility
+LEGACY_PRESET_ALIASES: Dict[str, str] = {
+    "MIDD": "FACE",
+    "MID": "FACE",
+    "M": "FACE",
+    "CHARACTER": "FACE",
+    "INS": "COMPOSITION",
+    "IN": "COMPOSITION",
+    "LAYOUT": "COMPOSITION",
+    "OUTS": "STYLE",
+    "OUTD": "TEXTURE",
+}
+
+def parse_block_weights(raw_str: str, profile: Optional[ArchitectureProfile] = None) -> Optional[List[float]]:
+    """Parse block weights via active profile."""
+    raw_str = str(raw_str).strip()
+    if not raw_str:
+        return None
+
+    if profile is None:
+        profile = PROFILE_REGISTRY["sdxl"]
+
+    upper = raw_str.upper()
+
+    # Resolve backward-compatibility aliases first
+    if upper in LEGACY_PRESET_ALIASES:
+        upper = LEGACY_PRESET_ALIASES[upper]
+
+    if upper == "RESET":
+        return [1.0] * profile.block_count
+
+    # 1. Preset lookup (case-insensitive)
+    for p_name, p_vec in profile.presets.items():
+        if p_name.upper() == upper:
+            vec = [float(x.strip()) for x in p_vec.split(",")]
+            if any(math.isnan(v) or math.isinf(v) for v in vec):
+                return None
+            return adapt_block_weights(vec, profile.block_count, arch=profile.name)
+
+    # 2. Check other profiles presets (cross-preset fallback, case-insensitive)
+    for p in PROFILE_REGISTRY.values():
+        for p_name, p_vec in p.presets.items():
+            if p_name.upper() == upper:
+                vec = [float(x.strip()) for x in p_vec.split(",")]
+                if any(math.isnan(v) or math.isinf(v) for v in vec):
+                    return None
+                return adapt_block_weights(vec, profile.block_count, arch=profile.name)
+
+    # 3. Single block alias
+    result = profile.resolve_block_name(upper)
+    if result is not None:
+        return result
+
+    # 4. Comma-separated floats
+    parts = raw_str.split(",")
+    try:
+        parsed = [float(x.strip()) for x in parts]
+        if any(math.isnan(v) or math.isinf(v) for v in parsed):
+            logger.warning(f"[LBW] Could not parse block weights (NaN or Inf encountered): {raw_str}")
+            return None
+        return adapt_block_weights(parsed, profile.block_count, arch=profile.name)
+    except ValueError:
+        logger.warning(f"[LBW] Could not parse block weights: {raw_str}")
+        return None
+
+
+def _is_block_weight_string(val) -> bool:
+    if not isinstance(val, str):
+        return False
+    val_str = val.strip()
+    if not val_str:
+        return False
+    # Comma-separated numbers
+    if "," in val_str and re.match(r"^[\d.,\s\-+eE]+$", val_str):
+        return True
+    val_upper = val_str.upper()
+    if val_upper == "RESET" or val_upper in LEGACY_PRESET_ALIASES:
+        return True
+    for prof in PROFILE_REGISTRY.values():
+        if any(pk.upper() == val_upper for pk in prof.presets) or val_upper in prof.block_names:
+            return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════
+#  Global State
+# ═══════════════════════════════════════════════════════════
+_active_block_weights = {}
+_last_lbw_state = None
+
+_original_activate = None
+_original_load_lora = None
+_patches_installed = False
+
+
+def _install_patches():
+    """Install monkeypatches on Forge's ExtraNetworkLora and networks loader."""
+    global _patches_installed, _original_activate, _original_load_lora
+
+    if _patches_installed:
+        return
+
+    logger.debug("[LBW] Starting _install_patches...")
+
+    try:
+        from modules.extra_networks import extra_network_registry
+        lora_net = extra_network_registry.get("lora")
+        if lora_net is not None and _original_activate is None:
+            _original_activate = lora_net.activate
+            lora_net.activate = _patched_activate.__get__(lora_net, type(lora_net))
+            logger.info("[LBW] Patched ExtraNetworkLora.activate")
+    except Exception as e:
+        logger.error(f"[LBW] Failed to patch ExtraNetworkLora.activate: {e}")
+        return
+
+    try:
+        try:
+            import networks as networks_module
+        except ImportError:
+            from extensions_builtin.sd_forge_lora import networks as networks_module
+        if _original_load_lora is None:
+            _original_load_lora = networks_module.load_lora_for_models
+            networks_module.load_lora_for_models = _patched_load_lora_for_models
+            logger.info("[LBW] Patched networks.load_lora_for_models")
+    except Exception as e:
+        logger.error(f"[LBW] Failed to patch networks.load_lora_for_models: {e}")
+        return
+
+    _patches_installed = True
+    logger.info("[LBW] All patches installed successfully")
+
+
+# ═══════════════════════════════════════════════════════════
+#  Patched ExtraNetworkLora.activate
+# ═══════════════════════════════════════════════════════════
+
+def _patched_activate(self, p, params_list):
+    global _active_block_weights, _last_lbw_state
+    _active_block_weights.clear()
+
+    def _call_original(args_list):
+        if hasattr(_original_activate, "__self__"):
+            return _original_activate(p, args_list)
+        return _original_activate(self, p, args_list)
+
+    if not params_list:
+        return _call_original(params_list)
+
+    for params in params_list:
+        if not getattr(params, "positional", None):
+            continue
+
+        name = params.positional[0]
+        block_weight_str = None
+
+        # 1. Named parameter lbw=...
+        if "lbw" in params.named:
+            block_weight_str = params.named.pop("lbw")
+
+        # 2. Positional cleaning
+        clean_positional = []
+        for i, val in enumerate(params.positional):
+            if i >= 2 and _is_block_weight_string(val):
+                if not block_weight_str or not _is_block_weight_string(block_weight_str):
+                    block_weight_str = str(val)
+            else:
+                clean_positional.append(val)
+
+        params.positional = clean_positional
+        params.items = params.positional + [f"{k}={v}" for k, v in params.named.items()]
+
+        if block_weight_str:
+            _active_block_weights[name] = block_weight_str
+            logger.info(f"[LBW] {name}: queued block weight string '{block_weight_str}'")
+
+    current_state = str(_active_block_weights)
+    if current_state != _last_lbw_state:
+        _last_lbw_state = current_state
+        _clear_forge_lora_cache()
+
+    return _call_original(params_list)
+
+
+def _clear_forge_lora_cache():
+    cleared = False
+    try:
+        sd_model = getattr(shared, "sd_model", None)
+        if sd_model is not None and hasattr(sd_model, "current_lora_hash"):
+            sd_model.current_lora_hash = None
+            cleared = True
+        from modules import sd_models
+        model_data = getattr(sd_models, "model_data", None)
+        if model_data is not None:
+            current_sd = model_data.get_sd_model()
+            if current_sd is not None:
+                current_sd.current_lora_hash = None
+                cleared = True
+    except Exception as e:
+        logger.error(f"[LBW] Error while clearing Forge LoRA cache: {e}")
+    if cleared:
+        logger.info("[LBW] Block weights changed; cleared Forge LoRA cache to force reload.")
+
+
+# ═══════════════════════════════════════════════════════════
+#  Patched load_lora_for_models
+# ═══════════════════════════════════════════════════════════
+
+def resolve_lora_weights(lora_basename: str, filename: str, active_weights: Dict[str, str]) -> Optional[str]:
+    """Resolve active block weights for a LoRA with exact matching (no substring leakage)."""
+    if not active_weights:
+        return None
+
+    # Step 1: Exact mapping via Forge's internal network dictionaries
+    try:
+        import networks as networks_module
+        current_path = os.path.normpath(os.path.abspath(filename)).lower()
+        for name, weights in active_weights.items():
+            net_on_disk = networks_module.available_network_aliases.get(name) or networks_module.available_networks.get(name)
+            if net_on_disk is not None and getattr(net_on_disk, "filename", None):
+                if os.path.normpath(os.path.abspath(net_on_disk.filename)).lower() == current_path:
+                    return weights
+    except Exception:
+        pass
+
+    # Step 2: Exact name match
+    if lora_basename in active_weights:
+        return active_weights[lora_basename]
+
+    # Step 3: Case-insensitive match & basename match (handling subfolder paths / and \)
+    lower = lora_basename.lower()
+    for name, weights in active_weights.items():
+        name_clean = os.path.splitext(os.path.basename(name.replace("\\", "/")))[0].lower()
+        if name.lower() == lower or name_clean == lower:
+            return weights
+
+    return None
+
+
+def _get_patcher(obj):
+    """Retrieve the underlying ModelPatcher instance if wrapped (e.g. CLIP.patcher)."""
+    if obj is None:
+        return None
+    if hasattr(obj, "patcher") and hasattr(obj.patcher, "patches"):
+        return obj.patcher
+    return obj
+
+
+def _patched_load_lora_for_models(model, clip, lora, strength_model, strength_clip,
+                                   filename="default", online_mode=False):
+    """Load LoRA and scale its model patches without tuple unpacking crashes."""
+    if not _active_block_weights:
+        return _original_load_lora(model, clip, lora, strength_model, strength_clip,
+                                   filename, online_mode)
+
+    # Snapshot patch counts before loading
+    old_lengths = {}
+    old_clip_lengths = {}
+    try:
+        model_patcher = _get_patcher(model)
+        if model_patcher is not None:
+            source_patches = model_patcher.weight_wrapper_patches if online_mode else model_patcher.patches
+            for k, v in source_patches.items():
+                old_lengths[k] = len(v)
+
+        clip_patcher = _get_patcher(clip)
+        if clip_patcher is not None:
+            source_clip_patches = clip_patcher.weight_wrapper_patches if online_mode else clip_patcher.patches
+            for k, v in source_clip_patches.items():
+                old_clip_lengths[k] = len(v)
+    except Exception as e:
+        logger.warning(f"[LBW] Failed to snapshot patch lengths: {e}")
+
+    new_model, new_clip = _original_load_lora(
+        model, clip, lora, strength_model, strength_clip, filename, online_mode
+    )
+
+    lora_basename = os.path.splitext(os.path.basename(filename))[0]
+    block_weights_str = resolve_lora_weights(lora_basename, filename, _active_block_weights)
+
+    if block_weights_str is None:
+        return new_model, new_clip
+
+    try:
+        new_model_patcher = _get_patcher(new_model)
+        if new_model_patcher is None:
+            return new_model, new_clip
+
+        # Detect architecture profile from base model keys when available, else new patches
+        patch_keys = set(new_model_patcher.weight_wrapper_patches.keys() if online_mode else new_model_patcher.patches.keys())
+        detect_keys = patch_keys
+        if hasattr(new_model_patcher, "model_state_dict"):
+            try:
+                model_keys = set(new_model_patcher.model_state_dict().keys())
+                if model_keys:
+                    detect_keys = model_keys
+            except Exception:
+                pass
+        profile = detect_model_profile(detect_keys)
+        block_weights = parse_block_weights(block_weights_str, profile=profile)
+
+        if block_weights is None:
+            return new_model, new_clip
+
+        scaled_count = 0
+
+        if online_mode:
+            # Scale OnlineLoRAPatch wrappers
+            for key, wrappers in new_model_patcher.weight_wrapper_patches.items():
+                old_len = old_lengths.get(key, 0)
+                if len(wrappers) <= old_len:
+                    continue
+                b_idx = profile.get_block_index(key)
+                scale = 1.0 if (b_idx is None or b_idx >= len(block_weights)) else float(block_weights[b_idx])
+                for i in range(old_len, len(wrappers)):
+                    w = wrappers[i]
+                    if hasattr(w, "patch") and isinstance(w.patch, list) and len(w.patch) > 0:
+                        pt = w.patch[0]
+                        if isinstance(pt, list) and len(pt) >= 1:
+                            pt[0] = pt[0] * scale
+                            scaled_count += 1
+        else:
+            # Scale offline patches: dynamic tuple slicing
+            for key, patches in new_model_patcher.patches.items():
+                old_len = old_lengths.get(key, 0)
+                if len(patches) <= old_len:
+                    continue
+                b_idx = profile.get_block_index(key)
+                scale = 1.0 if (b_idx is None or b_idx >= len(block_weights)) else float(block_weights[b_idx])
+                for i in range(old_len, len(patches)):
+                    pt = patches[i]
+                    patches[i] = (pt[0] * scale, *pt[1:])
+                    scaled_count += 1
+
+        # 2. Scale Text Encoder (CLIP / Qwen3 / T5) patches using BASE weight
+        new_clip_patcher = _get_patcher(new_clip)
+        if new_clip_patcher is not None and len(block_weights) > 0:
+            base_scale = float(block_weights[0])
+            if online_mode:
+                for key, wrappers in new_clip_patcher.weight_wrapper_patches.items():
+                    old_len = old_clip_lengths.get(key, 0)
+                    for i in range(old_len, len(wrappers)):
+                        w = wrappers[i]
+                        if hasattr(w, "patch") and isinstance(w.patch, list) and len(w.patch) > 0:
+                            pt = w.patch[0]
+                            if isinstance(pt, list) and len(pt) >= 1:
+                                pt[0] = pt[0] * base_scale
+            else:
+                for key, patches in new_clip_patcher.patches.items():
+                    old_len = old_clip_lengths.get(key, 0)
+                    for i in range(old_len, len(patches)):
+                        pt = patches[i]
+                        patches[i] = (pt[0] * base_scale, *pt[1:])
+
+        logger.info(f"[LBW] {lora_basename}: scaled {scaled_count} patches ({profile.display_name})")
+    except Exception as e:
+        logger.error(f"[LBW] Error while applying block weights to {lora_basename}: {e}", exc_info=True)
+
+    return new_model, new_clip
+
+
+# ═══════════════════════════════════════════════════════════
+#  Preset Management & API
+# ═══════════════════════════════════════════════════════════
+
+def _validate_weights_str(weights_str: str) -> bool:
+    parts = [p.strip() for p in weights_str.split(",")]
+    if not parts or any(p == "" for p in parts):
+        return False
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        return False
+    return not any(math.isnan(v) or math.isinf(v) for v in vals)
+
+
+def _save_preset_internal(prof_key: str, name: str, weights_str: str) -> bool:
+    """Save preset to USER_PRESETS_FILE atomically and reload engine state."""
+    if name.strip().upper() in BUILTIN_PRESET_NAMES:
+        logger.warning(f"[LBW] Cannot overwrite protected built-in preset '{name}'")
+        return False
+    if not _validate_weights_str(weights_str):
+        logger.warning(f"[LBW] Invalid preset weight string for '{name}': {weights_str}")
+        return False
+    try:
+        data = {}
+        if os.path.exists(USER_PRESETS_FILE):
+            with open(USER_PRESETS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data.setdefault(prof_key, {})[name] = weights_str.strip()
+        dir_name = os.path.dirname(USER_PRESETS_FILE)
+        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+            json.dump(data, tf, indent=4)
+            temp_path = tf.name
+        os.replace(temp_path, USER_PRESETS_FILE)
+        _load_user_presets()
+        return True
+    except Exception as e:
+        logger.error(f"[LBW] Failed to save preset: {e}")
+        return False
+
+
+def _delete_preset_internal(prof_key: str, name: str) -> bool:
+    """Delete preset from USER_PRESETS_FILE atomically and reload engine state."""
+    try:
+        if name.upper() in BUILTIN_PRESET_NAMES:
+            logger.warning(f"[LBW] Cannot delete protected built-in preset '{name}'")
+            return False
+
+        if not os.path.exists(USER_PRESETS_FILE):
+            return True
+        with open(USER_PRESETS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        # Remove from prof_key if present (case-insensitive)
+        removed = False
+        target_name_lower = name.strip().lower()
+        if prof_key in data:
+            keys_to_del = [k for k in data[prof_key] if k.lower() == target_name_lower]
+            for k in keys_to_del:
+                del data[prof_key][k]
+                removed = True
+        
+        # Also clean aliases if applicable
+        if prof_key in ("anima28", "anima40", "anima52") and "anima" in data:
+            keys_to_del = [k for k in data["anima"] if k.lower() == target_name_lower]
+            for k in keys_to_del:
+                del data["anima"][k]
+                removed = True
+        if prof_key in ("wan21_14b", "wan21_13b") and "wan" in data:
+            keys_to_del = [k for k in data["wan"] if k.lower() == target_name_lower]
+            for k in keys_to_del:
+                del data["wan"][k]
+                removed = True
+        if prof_key in ("moss_image", "moss") and "moss" in data:
+            keys_to_del = [k for k in data["moss"] if k.lower() == target_name_lower]
+            for k in keys_to_del:
+                del data["moss"][k]
+                removed = True
+            
+        if removed:
+            dir_name = os.path.dirname(USER_PRESETS_FILE)
+            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+                json.dump(data, tf, indent=4)
+                temp_path = tf.name
+            os.replace(temp_path, USER_PRESETS_FILE)
+        
+        # Reset profile preset dictionaries and reload
+        keys_to_clean = [prof_key]
+        if prof_key in ("anima28", "anima40", "anima52"):
+            keys_to_clean.extend(["anima28", "anima40", "anima52"])
+        elif prof_key in ("wan21_14b", "wan21_13b"):
+            keys_to_clean.extend(["wan21_14b", "wan21_13b"])
+        elif prof_key in ("sdxl", "sd15"):
+            keys_to_clean.extend(["sdxl", "sd15"])
+        elif prof_key in ("moss_image", "moss"):
+            keys_to_clean.extend(["moss_image", "moss"])
+
+        for k in set(keys_to_clean):
+            if k in PROFILE_REGISTRY:
+                to_del = [pk for pk in PROFILE_REGISTRY[k].presets if pk.lower() == target_name_lower]
+                for pk in to_del:
+                    del PROFILE_REGISTRY[k].presets[pk]
+
+        _load_user_presets()
+        return True
+    except Exception as e:
+        logger.error(f"[LBW] Failed to delete preset: {e}")
+        return False
+
+
+def _normalize_arch_key(arch: str) -> str:
+    """Normalize input architecture name to internal profile key."""
+    if arch in ("anima", "anima28"):
+        return "anima28"
+    if arch in ("flux", "flux1"):
+        return "flux1"
+    if arch in ("moss", "moss_image", "moss-image"):
+        return "moss_image"
+    if arch in ("anima40", "anima52", "flux_k9b", "flux_k4b", "wan21_14b", "wan21_13b", "qwen_image", "sdxl"):
+        return arch
+    return "sdxl"
+
+
+def _get_all_presets_dict() -> Dict[str, Dict[str, str]]:
+    """Return all presets grouped by architecture."""
+    out = {}
+    for prof_name, prof in PROFILE_REGISTRY.items():
+        out[prof_name] = dict(prof.presets)
+    return out
+
+
+# Register API endpoints with FastAPI on WebUI launch
+try:
+    from modules import script_callbacks
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+
+    def _on_app_started(demo: Optional[Any], app: FastAPI):
+        _install_patches()
+
+        @app.get("/lbw/api/presets")
+        async def api_get_presets():
+            return JSONResponse({"presets": _get_all_presets_dict()})
+
+        @app.get("/lbw/api/detect_lora")
+        async def api_detect_lora(name: str = ""):
+            name = name.strip()
+            if not name:
+                return JSONResponse({"arch": None, "error": "LoRA name required"}, status_code=400)
+            try:
+                profile = detect_lora_arch_by_name(name)
+                if profile is not None:
+                    return JSONResponse({
+                        "arch": profile.name,
+                        "block_count": profile.block_count,
+                        "display_name": profile.display_name
+                    })
+                return JSONResponse({"arch": None})
+            except Exception as e:
+                logger.debug(f"[LBW] Error detecting architecture for '{name}': {e}")
+                return JSONResponse({"arch": None, "error": str(e)}, status_code=500)
+
+        @app.post("/lbw/api/presets")
+        async def api_save_preset(req: Request):
+            try:
+                body = await req.json()
+                arch = body.get("arch", "sdxl")
+                name = body.get("name", "").strip()
+                weights = body.get("weights", "").strip()
+                if not name or not weights:
+                    return JSONResponse({"success": False, "error": "Name and weights are required"}, status_code=400)
+                if name.upper() in BUILTIN_PRESET_NAMES:
+                    return JSONResponse({"success": False, "error": f"Cannot overwrite built-in preset '{name}'"}, status_code=400)
+                if not _validate_weights_str(weights):
+                    return JSONResponse({"success": False, "error": "Invalid block weight vector"}, status_code=400)
+
+                prof_key = _normalize_arch_key(arch)
+                success = _save_preset_internal(prof_key, name, weights)
+                return JSONResponse({"success": success, "presets": _get_all_presets_dict()})
+            except Exception as e:
+                return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+        @app.delete("/lbw/api/presets")
+        async def api_delete_preset(req: Request):
+            try:
+                body = await req.json()
+                arch = body.get("arch", "sdxl")
+                name = body.get("name", "").strip()
+                if not name:
+                    return JSONResponse({"success": False, "error": "Preset name is required"}, status_code=400)
+
+                prof_key = _normalize_arch_key(arch)
+                success = _delete_preset_internal(prof_key, name)
+                return JSONResponse({"success": success, "presets": _get_all_presets_dict()})
+            except Exception as e:
+                return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    script_callbacks.on_app_started(_on_app_started)
+except Exception as e:
+    logger.debug(f"[LBW] script_callbacks setup skipped: {e}")
+
+
+class LoraBlockWeight(scripts.Script):
+    def title(self):
+        return "SD Forge LBW"
+
+    def show(self, is_img2img):
+        return scripts.AlwaysVisible
+
+    def ui(self, is_img2img):
+        return []
+
+    def process(self, p, *args, **kwargs):
+        global _active_block_weights
+        _active_block_weights.clear()
+        _install_patches()
+
+    def postprocess(self, p, processed, *args, **kwargs):
+        global _active_block_weights
+        _active_block_weights.clear()
